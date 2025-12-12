@@ -1,21 +1,11 @@
-import time
-import os
-import json
 import tempfile
 
 import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
-
-from google import genai
-from google.genai.types import GenerateContentConfig, Part
-from google.genai import types
-
-from pydantic import BaseModel
-from typing import Optional
-
-from google.genai import types
+from transformers import pipeline
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
 from utils.technical_analysis import analyze_stock
 
@@ -26,20 +16,6 @@ st.set_page_config(
     page_icon="🕵🏻‍♂️",
     layout="wide"
 )
-
-# Company class model 
-class Company(BaseModel):
-    """
-    A model representing a company with relevant attributes
-    """
-
-    name: str
-    symbol: Optional[str]
-    public: bool
-    sector: Optional[str]
-    industry: Optional[str]
-    sentiment: int
-    note: str
 
 # Function to get earnings call transcripts
 def get_earnings_calls(symbol, year, quarter, api_key):
@@ -72,35 +48,89 @@ def save_image_file(uploaded_file):
         st.error(f"Error handling uploaded file: {e}")
         return None
 
-# Input Token Count
-def input_token_count(response):
-    token_count = response.usage_metadata
+def summarize_text(text: str) -> str:
+    summarizer = get_summarizer()
+    words = text.split()
+    summaries = []
+    # Chunk long texts so we do not overwhelm the small offline model
+    for i in range(0, len(words), 800):
+        chunk = " ".join(words[i : i + 800])
+        summary = summarizer(
+            chunk,
+            max_length=200,
+            min_length=60,
+            do_sample=False,
+        )[0]["summary_text"]
+        summaries.append(summary)
+    return "\n\n".join(summaries)
 
-    input_tokens = token_count.prompt_token_count
-    output_tokens = token_count.candidates_token_count
-    total_token_count = token_count.total_token_count
 
-    st.write(f"🔸 Input Tokens: {input_tokens}")
-    st.write(f"🔸 Output Tokens: {output_tokens}")
-    st.write(f"🔸 Total Tokens: {total_token_count}")
+def sentiment_breakdown(text: str) -> pd.DataFrame:
+    model = get_sentiment_model()
+    raw_scores = model(text[:5000])[0]
+    rows = []
+    for entry in raw_scores:
+        rows.append({
+            "label": entry["label"].replace("LABEL_", "").title(),
+            "score": round(entry["score"], 3)
+        })
+    return pd.DataFrame(rows)
+
+
+def caption_image(path: str) -> str:
+    captioner = get_image_captioner()
+    return captioner(Image.open(path))[0]["generated_text"]
+
+
+def transcribe_audio(path: str) -> str:
+    transcriber = get_transcriber()
+    result = transcriber(path)
+    return result["text"] if isinstance(result, dict) else result
+
+
+def fetch_youtube_transcript(video_url: str) -> str:
+    """Pull a transcript from YouTube without an API key."""
+    video_id = video_url.split("v=")[-1].split("&")[0]
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+    except (TranscriptsDisabled, NoTranscriptFound):
+        st.error("Transcript is unavailable for this video.")
+        return ""
+    except Exception as e:
+        st.error(f"Unable to fetch transcript: {e}")
+        return ""
+
+    return " ".join([entry["text"] for entry in transcript])
 
 
 # Streamlit app title
 st.title("🕵🏻‍♂️ AI-Powered Financial Research Analyst")
 
-# Sidebar for API keys
-st.sidebar.header("API Keys")
-FMP_API_KEY = st.sidebar.text_input("Enter your FMP API Key", type="password")
-st.sidebar.info("Get your FMP API key [here](https://financialmodelingprep.com)")
-GEMINI_API_KEY = st.sidebar.text_input("Enter your Gemini API Key", type="password")
-st.sidebar.info("Get your Gemini API key [here](https://ai.google.dev/gemini-api/docs/api-key)")
+@st.cache_resource(show_spinner=False)
+def get_summarizer():
+    """Lightweight summarization pipeline that works without API keys."""
+    return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    model = "gemini-2.0-flash"
-    config = {"response_modalities": ["TEXT"]}
-else:
-    st.sidebar.warning("⚠️ Please provide a valid Gemini API key to proceed.")
+
+@st.cache_resource(show_spinner=False)
+def get_sentiment_model():
+    return pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-sentiment", return_all_scores=True)
+
+
+@st.cache_resource(show_spinner=False)
+def get_image_captioner():
+    return pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+
+
+@st.cache_resource(show_spinner=False)
+def get_transcriber():
+    return pipeline("automatic-speech-recognition", model="openai/whisper-tiny")
+
+
+# Sidebar for API keys
+st.sidebar.header("Optional API Keys")
+FMP_API_KEY = st.sidebar.text_input("Enter your FMP API Key", type="password")
+st.sidebar.info("Get your FMP API key [here](https://financialmodelingprep.com). Paste a transcript below if you prefer not to use an API key.")
 
 # Tabs for different sections
 tabs = ["📞 Earnings Call Analysis", "📸 Image/Chart Analysis", "🎙️ Podcast Analysis", "🎥 Youtube Video Analysis"]
@@ -120,87 +150,41 @@ with tab1:
     with col3:
         quarter = st.selectbox("Select Quarter", ["Q1", "Q2", "Q3", "Q4"])
 
+    manual_transcript = st.text_area(
+        "Or paste any transcript text (no API key required)",
+        placeholder="Paste earnings call notes or any long-form text to summarize",
+        height=200,
+    )
+
     if st.button("Process Earnings Call"):
-        if not FMP_API_KEY:
-            st.error("⚠️ FMP API Key is missing! Please provide a valid API key in the side bar to proceed.")
+        if not manual_transcript and not FMP_API_KEY:
+            st.error("Please paste a transcript or provide an FMP API key to download one.")
         else:
-            with st.spinner('Processing...'):
-                transcript = get_earnings_calls(symbol, year, quarter, FMP_API_KEY)
-                if not transcript:
-                    st.warning("⚠️ No earnings call transcript found for this company and quarter.")
-                else:
-                    # Define system instruction
-                    system_instruction = """
-                    You are a stock market analyst who analyzes earnings call transcripts and provides a comprehensive summary.
+            with st.spinner('Processing with free local models...'):
+                transcript_text = manual_transcript
+                if not transcript_text and FMP_API_KEY:
+                    transcript = get_earnings_calls(symbol, year, quarter, FMP_API_KEY)
+                    if transcript and isinstance(transcript, list):
+                        transcript_text = transcript[0].get('content', '')
+                    else:
+                        st.warning("⚠️ No earnings call transcript found for this company and quarter.")
+                        transcript_text = ""
 
-                    Follow these steps for comprehensive financial analysis:
-
-                    1. Financial Performance Summary
-                    2. Product and Service Breakdown 
-                    3. Geographical Breakdown
-                    4. Challenges and Risks
-                    5. Future Outlook
-                    6. Other Topics
-                
-                    Your reporting style:
-                    - Highlight key insights with bullet points
-                    - Use tables for data presentation
-                    - Include technical term explanations
-                    - Commentary and insights should be succinct but informative
-                    """
-
-                    response = client.models.generate_content(
-                        model=model, 
-                        contents=transcript[0]['content'], 
-                        config=GenerateContentConfig(
-                            system_instruction = system_instruction
-                        ),
-                    )
+                if transcript_text:
+                    summary = summarize_text(transcript_text)
                     st.subheader(f"{quarter} {year} Earnings Call Summary:")
-                    st.write(response.text)
+                    st.write(summary)
 
-                    # Show token usage
-                    with st.expander("🔍 Show Token Usage", expanded=False):
-                        # Output Token Count
-                        input_token_count(response)
-
-                    # Define system instruction
-                    system_instruction = """
-                    You are a stock market analyst who analyzes market sentiment given the earnings call transcripts.
-                    
-                    - Extract all of the companies mentioned, including the company name, the ticker symbol, whether they are publicly traded or nor not, the industry and sector they are operating in.
-                    - Analyze the sentiment for each company extracted, and give a score 1 if the sentiment is positive, -1 if neagtive, and 0 if the sentiment is neutral. Reiterate the statement
-                    - Give a one sentence explanation for teh senntiment score
-
-                    Exclude company names which are only mentioned during analyst introductions.
-                    """
-
-                    response = client.models.generate_content(
-                        model=model, 
-                        contents=transcript[0]['content'], 
-                        config=GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            response_mime_type= "application/json",
-                            response_schema= list[Company]
-                            )
-                    )    
-
-                    st.subheader("Companies Mentioned:")
-
-                    json_output = json.loads(response.text)
-                    df_data = pd.DataFrame(json_output)
-                    st.write(df_data)
-
-                    # Show token usage
-                    with st.expander("🔍 Show Token Usage", expanded=False):
-                        # Output Token Count
-                        input_token_count(response)
+                    st.subheader("Sentiment Snapshot")
+                    st.dataframe(sentiment_breakdown(transcript_text), use_container_width=True)
+                else:
+                    st.info("Please provide a transcript to analyze.")
 
 
 with tab2:
     st.subheader("Analyze Images&Charts")
     analysis_type = st.radio(
-        
+
         "Please select",
         ["Image Analysis", "Technical Chart Analysis"],
         captions=[
@@ -218,42 +202,9 @@ with tab2:
             st.image(img, "Uploaded image")
 
             if st.button("Process Image"):
-                if not GEMINI_API_KEY:
-                    st.error("⚠️ Gemini API Key is missing! Please provide a valid API key in the side bar to proceed.")
-                else:
-                    with st.spinner('Processing...'):
-                        image_path = client.files.upload(file=image_path)
-
-                        # Define system instruction
-                        system_instruction = """
-                        You are a financial market analyst. Analyze this image for financial insights and provide:
-                
-                        1. Executive Summary
-                        {Concise overview of key findings and significance}
-
-                        2. Key Findings
-                        {Main discoveries and analysis}
-                        {Expert insights and quotes}
-
-                        Your reporting style:
-                        - Highlight key insights with bullet points
-                        - Include technical term explanations
-                        """
-
-                        response = client.models.generate_content(
-                            model=model, 
-                            contents=image_path, 
-                            config=GenerateContentConfig(
-                                system_instruction = system_instruction
-                            ),
-                        )
-                        st.subheader(f"Image Analyis:")
-                        st.write(response.text)
-
-                        # Show token usage
-                        with st.expander("🔍 Show Token Usage", expanded=False):
-                            # Output Token Count
-                            input_token_count(response)
+                with st.spinner('Captioning with free model...'):
+                    st.subheader("Image Analysis:")
+                    st.write(caption_image(image_path))
 
     if analysis_type == "Technical Chart Analysis":
         st.subheader("Basic Settings")
@@ -281,63 +232,33 @@ with tab2:
 
         # Get technical analysis results
         result = analyze_stock(symbol, period, interval, indicators)
-        
+
         if result is not None:
             st.plotly_chart(result['figure'], use_container_width=True)
-            
+
         if symbol is not None:
             if st.button("Start Analysis"):
-                if not GEMINI_API_KEY:
-                    st.error("⚠️ Gemini API Key is missing! Please provide a valid API key in the side bar to proceed.")
-                else:
-                    image_path = save_image_file(result['figure'])
+                with st.spinner('Generating rule-based summary...'):
+                    summary_lines = []
+                    supports = result.get("support_levels", [])
+                    resistances = result.get("resistance_levels", [])
 
-                    # Read content from temp_file
-                    with open(image_path, 'rb') as f:
-                        local_file_img_bytes = f.read()
+                    if supports:
+                        summary_lines.append(f"Recent support areas: {', '.join([f'${level:.2f}' for level in supports])}")
+                    if resistances:
+                        summary_lines.append(f"Recent resistance areas: {', '.join([f'${level:.2f}' for level in resistances])}")
 
-                    with st.spinner('Processing...'):
-                        # Get technical analysis results and chart path
+                    if result.get("double_top"):
+                        summary_lines.append("Pattern watch: possible double top detected.")
+                    if result.get("double_bottom"):
+                        summary_lines.append("Pattern watch: possible double bottom detected.")
 
-                            # Define system instruction for technical analysis
-                            system_instruction = """
-                            You are an expert technical analyst. Analyze this stock chart and provide:
+                    if not summary_lines:
+                        summary_lines.append("No major patterns detected. Review the chart above for indicator context.")
 
-                            1. Technical Analysis Summary
-                            A detailed explanation of your analysis, including: 
-                            - Trend analysis
-                            - Pattern identification
+                    st.subheader("Technical Analysis Summary")
+                    st.write("\n\n".join(summary_lines))
 
-                            2. Trading Recommendation
-                            Based on your analysis and the the chart, provide:
-                            - BUY, SELL, or HOLD recommendation
-                            - Detailed rationale for the recommendation
-                            - Key risk factors to consider
-                            - Suggested entry/exit points if the recommendation is BUY or SELL. Otherwise skip this section.
-
-                            Format your response in a clear, structured manner with bullet points.
-                            Be specific about price levels and technical indicators.
-                            """
-
-                            response = client.models.generate_content(
-                                model=model, 
-                                contents=[Part.from_bytes(data=local_file_img_bytes, mime_type="image/png")], 
-                                config=GenerateContentConfig(
-                                    system_instruction = system_instruction
-                                ),
-                            )
-
-                            # Display the analysis
-                            st.subheader("Technical Analysis Summary")
-                            st.write(response.text)
-
-                            # Show token usage
-                            with st.expander("🔍 Show Token Usage", expanded=False):
-                                input_token_count(response)
-
-                            # Clean up the temporary file
-                            os.unlink(image_path)
-                        
 with tab3:
     st.subheader("Analyze Podcasts")
     audio_file = st.file_uploader("Upload Podcast File (MP3)", type=['mp3'])
@@ -347,73 +268,13 @@ with tab3:
         st.audio(audio_path)
 
         if st.button("Process Podcast"):
-            if not GEMINI_API_KEY:
-                st.error("⚠️ Gemini API Key is missing! Please provide a valid API key in the side bar to proceed.")
-            else:
-                with st.spinner('Processing...'):
-                    audio_file = client.files.upload(file=audio_path)
+            with st.spinner('Transcribing and summarizing with free models...'):
+                transcript = transcribe_audio(audio_path)
+                st.subheader("Podcast Summary:")
+                st.write(summarize_text(transcript))
 
-                    # Define system instruction
-                    system_instruction = """
-                    You are a financial market analyst. Analyze this podcast for financial insights and provide:
-            
-                    1. Executive Summary
-                    {Concise overview of key findings and significance}
-
-                    2. Key Findings
-                    {Main discoveries and analysis}
-                    {Expert insights and quotes}
-
-                    Your reporting style:
-                    - Highlight key insights with bullet points
-                    - Include technical term explanations
-                    - Commentary and insights should be succinct but informative
-                    """
-
-                    response = client.models.generate_content(
-                        model=model, 
-                        contents=audio_file, 
-                        config=GenerateContentConfig(
-                            system_instruction = system_instruction
-                        ),
-                    )
-                    st.subheader(f"Podcast Summary:")
-                    st.write(response.text)
-
-                    # Show token usage
-                    with st.expander("🔍 Show Token Usage", expanded=False):
-                        # Output Token Count
-                        input_token_count(response)
-
-                    # Define system instruction
-                    system_instruction = """
-                    You are a stock market analyst who analyzes market sentiment given the podcast interview. Based on the interview, extract all mentioned companies.
-                    
-                    - For each company you extracted, provide the name, indicate if it's publicly traded, and if applicable, provide the stock symbol
-                    - Give a score 1 if the sentiment is positive, -1 if neagtive, and 0 if the sentiment is neutral towards the mentioned company
-                    - Reiterate the statement
-                    - Give a one sentence explanation
-
-                    """
-                    response = client.models.generate_content(
-                        model=model, 
-                        contents=audio_file,
-                        config=GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            response_mime_type= "application/json",
-                            response_schema= list[Company]
-                            )
-                    )
-
-                    st.subheader("Companies Mentioned:")
-
-                    json_output = json.loads(response.text)
-                    df_data = pd.DataFrame(json_output)
-                    st.write(df_data)
-
-                    # Show token usage
-                    with st.expander("🔍 Show Token Usage", expanded=False):
-                        input_token_count(response)
+                st.subheader("Sentiment Snapshot")
+                st.dataframe(sentiment_breakdown(transcript), use_container_width=True)
 
 with tab4:
     st.subheader("Analyze YT Videos")
@@ -430,83 +291,11 @@ with tab4:
             st.error(f"An error occurred: {e}")
 
         if st.button("Process Video"):
-            if not GEMINI_API_KEY:
-                st.error("⚠️ Gemini API Key is missing! Please provide a valid API key in the side bar to proceed.")
-            else:
-                with st.spinner('Processing...'):
-                    
-                    # Define system instruction
-                    system_instruction = """
-                        You are a financial market analyst. Analyze this video for financial insights and provide:
-                    
-                        1. Executive Summary
-                        {Concise overview of key findings and significance}
+            with st.spinner('Summarizing transcript with free model...'):
+                transcript = fetch_youtube_transcript(video_url)
+                if transcript:
+                    st.subheader("Video Summary:")
+                    st.write(summarize_text(transcript))
 
-                        2. Key Findings
-                        {Main discoveries and analysis}
-                        {Expert insights and quotes}
-
-                        Your reporting style:
-                        - Highlight key insights with bullet points
-                        - Include technical term explanations
-                        - Commentary and insights should be succinct but informative
-                        """
-
-                    response = client.models.generate_content(
-                        model=model, 
-                        contents=types.Content(
-                            parts=[
-                                types.Part(
-                                    file_data=types.FileData(file_uri=video_url)
-                                )
-                            ]
-                        ),
-                        config=GenerateContentConfig(
-                            system_instruction = system_instruction,
-                        )
-                    )
-                    
-                    st.subheader(f"Video Summary:")
-                    st.write(response.text)
-
-                    #Show token usage 
-                    with st.expander("🔍 Show Token Usage", expanded=False):
-                        # Output Token Count
-                        input_token_count(response)
-
-                    # Define system instruction
-                    system_instruction = """
-                    You are a stock market analyst who analyzes market sentiment given the earnings call transcripts. Based on the transcripts, extract all mentioned companies.
-                    
-                    - For each company you extracted, provide the name, indicate if it's publicly traded, and if applicable, provide the stock symbol
-                    - Give a score 1 if the sentiment is positive, -1 if neagtive, and 0 if the sentiment is neutral towards the mentioned company
-                    - Reiterate the statement
-                    - Gove a one sentence explanation
-
-                    Exclude company names which are only mentioned during analyst introductions.
-                    """
-                    response = client.models.generate_content(
-                        model=model, 
-                        contents=types.Content(
-                            parts=[
-                                types.Part(
-                                    file_data=types.FileData(file_uri=video_url)
-                                )
-                            ]
-                        ),
-                        config=GenerateContentConfig(
-                            system_instruction = system_instruction,
-                            response_mime_type= "application/json",
-                            response_schema= list[Company]
-                            )
-                    )
-
-                    st.subheader("Companies Mentioned:")
-
-                    json_output = json.loads(response.text)
-                    df_data = pd.DataFrame(json_output)
-                    st.write(df_data)
-
-                    # Show token usage
-                    with st.expander("🔍 Show Token Usage", expanded=False):
-                        input_token_count(response)
+                    st.subheader("Sentiment Snapshot")
+                    st.dataframe(sentiment_breakdown(transcript), use_container_width=True)

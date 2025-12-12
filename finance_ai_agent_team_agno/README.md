@@ -1,8 +1,6 @@
-# AI Finance Agent Team 
+# AI Finance Agent Team (Free Edition)
 
-A Streamlit-based application that provides comprehensive market analysis by combining real-time stock data and news insights using AI agents.
-
-This project demonstrates the power of [Agno AI's](https://github.com/agno-ai/agno) agent-based architecture to create a financial analysis team. It combines multiple specialized AI agents to deliver comprehensive market insights.
+A Streamlit-based application that provides quick market context by combining open web search, YFinance snapshots, and a free local summarizer. No API keys required.
 
 ## Web App
 
@@ -10,13 +8,11 @@ Try it yourself 👉 [Streamlit App](https://ai-finance-agent-team.streamlit.app
 
 ## Features
 
-This project showcases several key Agno AI features:
+This project now focuses on free and open resources:
 
-- **Multi-Agent System**: Coordinated team of specialized agents
-- **Tool Integration**: Seamless use of financial and web search tools
-- **Streaming Responses**: Real-time response generation
-- **Structured Output**: Markdown-formatted professional reports
-- **Model Flexibility**: Currently using Google Gemini, easily switchable to other models
+- **DuckDuckGo-powered discovery**: Pull recent headlines and snippets without any keys
+- **YFinance snapshots**: Grab price and key stats for an optional ticker
+- **Local summarization**: Uses a lightweight Hugging Face pipeline instead of paid APIs
 
 ## 🛫 Getting Started
 
@@ -40,10 +36,8 @@ cd ai-meets-finance/finance_ai_agent_team_agno
 pip install -r requirements.txt
 ```
 
-4. Get your Gemini API Key
+4. Launch Streamlit
 
-- Generate an API key from [Google AI Studio](https://ai.google.dev/gemini-api/docs/api-key)
-
-## Acknowledgments
-
-Built with [Agno AI](https://github.com/agno-ai/agno) - The Agent Framework for Building AI Applications
+```
+streamlit run main.py
+```
